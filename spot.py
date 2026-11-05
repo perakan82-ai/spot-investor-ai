@@ -949,6 +949,37 @@ def find_replacement_model(client, err_msg: str, tried: set):
     return None
 
 
+def make_client(raw_key: str, model: str):
+    """ตรวจ API Key ก่อนเริ่ม (กันสแกนไปครึ่งทางแล้วค่อยพัง)
+    คีย์แบบใหม่ที่ขึ้นต้นด้วย 'AQ.' บางบัญชีใช้กับ endpoint ปกติไม่ได้ → ลองโหมด Vertex AI Express ให้อัตโนมัติ"""
+    key = (raw_key or "").strip().strip('"').strip("'").strip()
+    attempts = [("Gemini API", {"api_key": key})]
+    if key.startswith("AQ."):
+        attempts.append(("Vertex AI Express", {"api_key": key, "vertexai": True}))
+    errors = []
+    for label, kw in attempts:
+        try:
+            c = genai.Client(**kw)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{label}: {str(e)[:160]}")
+            continue
+        try:
+            c.models.generate_content(model=model, contents="ping",
+                                      config=types.GenerateContentConfig(max_output_tokens=5))
+            return c, label
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            if any(k in msg for k in ("401", "403", "UNAUTHENTICATED", "PERMISSION_DENIED", "API_KEY_INVALID",
+                                       "API key not valid")):
+                errors.append(f"{label}: {msg[:160]}")
+                continue
+            return c, label  # error อื่น (โมเดลไม่ว่าง/404) ไม่เกี่ยวกับคีย์ → ไปต่อได้ เดี๋ยว gemini_call จัดการ
+    hint = ("คีย์ขึ้นต้นด้วย 'AQ.' ซึ่งเป็นรูปแบบใหม่ที่ยังใช้ไม่ได้กับบางบัญชี → สร้างคีย์แบบ 'AIza...' แทน"
+            if key.startswith("AQ.") else
+            "ตรวจว่าคัดลอกคีย์ครบ ไม่มีช่องว่าง/เครื่องหมายคำพูด และเป็นคีย์จาก aistudio.google.com/apikey")
+    raise RuntimeError(f"GEMINI_API_KEY ใช้ไม่ได้ — {hint}\nรายละเอียด: " + " | ".join(errors))
+
+
 def gemini_call(client, model, prompt, schema=None, search=False, temperature=0.3, max_retries=4):
     """คืน (ผลลัพธ์, แหล่งอ้างอิง) — schema=None คืนข้อความ"""
     kw = {"temperature": temperature}
@@ -1460,7 +1491,15 @@ if scan:
     if len(wl) < 3:
         st.error("ใส่เหรียญใน Watchlist อย่างน้อย 3 เหรียญ")
         st.stop()
-    client = genai.Client(api_key=gemini_key)
+    try:
+        client, key_mode = make_client(gemini_key, model_choice)
+    except RuntimeError as e:
+        st.error(str(e))
+        st.info("วิธีแก้: เปิด aistudio.google.com/apikey → Create API key → เลือก/สร้าง Project ใหม่ "
+                "→ คัดลอกคีย์ที่ขึ้นต้นด้วย AIza มาวางใน Sidebar หรือ Settings → Secrets ของแอปนี้")
+        st.stop()
+    if key_mode != "Gemini API":
+        st.toast(f"เชื่อมต่อผ่าน {key_mode}")
     st.session_state["active_model"] = st.session_state.get("model_override", {}).get(model_choice, model_choice)
     t0, notes = time.time(), []
     with st.status("กำลังวิเคราะห์...", expanded=True) as status:
