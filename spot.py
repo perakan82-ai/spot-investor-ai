@@ -924,9 +924,15 @@ def extract_sources(resp) -> list:
     return out
 
 
+BACKUP_MODELS = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash-lite"]
+
+
 def find_replacement_model(client, err_msg: str, tried: set):
     for m in re.findall(r"models/([\w.\-]+)", err_msg):
         if m not in tried:
+            return m
+    for m in BACKUP_MODELS:  # รายชื่อสำรองที่รู้จัก (ไม่ต้องรอ list API)
+        if m not in tried and not st.session_state.get("dead_models", {}).get(m):
             return m
     try:
         names = []
@@ -1021,6 +1027,7 @@ def gemini_call(client, model, prompt, schema=None, search=False, temperature=0.
                 return new
 
             if ("404" in msg or "NOT_FOUND" in msg) and len(tried) < 6:
+                st.session_state.setdefault("dead_models", {})[model] = True
                 new = switch(True)
                 if new:
                     model, attempt = new, attempt - 1
@@ -1033,8 +1040,9 @@ def gemini_call(client, model, prompt, schema=None, search=False, temperature=0.
                     if new:
                         model = new
                         continue
-                st.toast(f"Gemini ไม่ว่างชั่วคราว — รอ {10 * busy[model]} วินาที")
-                time.sleep(10 * busy[model])
+                wait = min(60, 8 * 2 ** (busy[model] - 1)) + float(np.random.uniform(0, 3))  # 8, 16, 32, 60 วินาที
+                st.toast(f"Gemini ไม่ว่างชั่วคราว ({model}) — รอ {wait:.0f} วินาที")
+                time.sleep(wait)
                 continue
             if isinstance(e, ValueError):
                 time.sleep(3)
@@ -1445,6 +1453,120 @@ def corr_pairs(analyses: dict, thr=0.85) -> tuple:
 
 
 # =============================================================================
+# FALLBACK: แผนจากระบบ (เมื่อ Gemini ไม่ว่าง)
+# =============================================================================
+def rule_strategy(A_: dict, F_: dict, RS_: dict, M_: dict, n_med: int, n_long: int) -> Strategy:
+    reg = M_["regime"]
+    fg = (M_["fng"] or {}).get("value", 50)
+    cash = 20.0 if "Bull" in reg else (55.0 if "Bear" in reg else 35.0)
+    cash += 10 if fg >= 75 else 0
+
+    def ok_bt(a):
+        return not (np.isfinite(a["bt"]["exp_r"]) and a["bt"]["exp_r"] < 0)
+
+    med = sorted([b for b, a in A_.items() if a["status_med"] == "BUY" and ok_bt(a)], key=lambda b: -A_[b]["score_med"])
+    med += sorted([b for b, a in A_.items() if a["status_med"] == "WAIT" and b not in med and a["score_med"] >= 55],
+                  key=lambda b: -A_[b]["score_med"])
+    med = [b for b in med if A_[b]["wr_med"] >= 45][:n_med]
+    lng = sorted([b for b, a in A_.items()
+                  if a["status_long"] != "AVOID" and a["score_long"] >= 50 and a["wr_long"] >= 45],
+                 key=lambda b: -A_[b]["score_long"])[:n_long]
+    invest = 100 - cash
+    long_budget = invest * 0.65 if (lng and med) else (invest if lng else 0)
+    med_budget = invest - long_budget if med else 0
+    alloc = {}
+    if lng:
+        w = {b: 2.0 if b in ("BTC", "ETH") else 1.0 for b in lng}
+        for b in lng:
+            alloc[(b, "LONG")] = min(long_budget * w[b] / sum(w.values()), 40 if b in ("BTC", "ETH") else 15)
+    for b in med:
+        alloc[(b, "MEDIUM")] = min(med_budget / len(med), 15)
+
+    def conv(s):
+        return "สูง" if s >= 70 else ("กลาง" if s >= 58 else "ต่ำ")
+
+    picks = []
+    for hz, group in (("MEDIUM", med), ("LONG", lng)):
+        for b in group:
+            a, f, r = A_[b], F_.get(b) or {}, RS_.get(b)
+            sn, rk = a["snap"], a["risk"]
+            tech = (f"1D {sn['1d']['trend']} (score {sn['1d']['score']}, RSI {sn['1d']['rsi']}), "
+                    f"โครงสร้าง {a['struct_1d']}; 1W {sn['1w']['trend'] if sn['1w'] else '-'} "
+                    f"({a['struct_1w']}); RS90 vs BTC {fmt_pct(rk['rs90'])}")
+            fund_t = (f"อันดับ #{f.get('rank')}, MCap {fmt_big(f.get('mcap'))}, FDV/MC {f.get('fdv_mcap', np.nan):.2f}, "
+                      f"ห่าง ATH {fmt_pct(a['dd_ath'])}" if f else f"ห่าง ATH {fmt_pct(a['dd_ath'])} (ไม่มีข้อมูลพื้นฐาน)")
+            cat = ("; ".join(f"{e.date} {e.title}" for e in r.events[:3]) if r and r.events
+                   else "ไม่มีข้อมูลกำหนดการ (ตรวจข่าวเพิ่มเอง)")
+            if hz == "MEDIUM":
+                pl, fb = a["plan_med"], a["fwd_med"]["best"]
+                stat = (f"Backtest {a['bt']['wr_raw']:.0f}% (n={a['bt']['n']})" if a["bt"]["n"] else "Backtest ไม่พอ")
+                picks.append(Pick(
+                    symbol=b, horizon="MEDIUM", conviction=conv(a["score_med"]),
+                    action_th=("ตั้ง Limit Buy ในโซนซื้อได้เลย" if a["status_med"] == "BUY"
+                               else "รอราคาย่อลงมาในโซนซื้อ แล้วค่อยเข้า"),
+                    win_rate=int(round(a["wr_med"])), hold_min_days=int(a["hold_med"][0]),
+                    hold_max_days=int(a["hold_med"][1]), allocation_pct=round(alloc[(b, hz)], 1),
+                    thesis_th=f"คะแนนระยะกลาง {a['score_med']:.0f}/100 · {stat}"
+                              + (f" · ในอดีตสภาพเดียวกันถือ {fmt_days(fb['h'])} ชนะ {fb['win']:.0f}%" if fb else ""),
+                    technical_th=tech, fundamental_th=fund_t, catalyst_th=cat,
+                    entry_trigger_th="แท่ง 4H ปิดยืนเหนือ EMA21 ขณะราคาอยู่ในโซนซื้อ",
+                    exit_plan_th="ขาย 50% ที่ TP1 แล้วเลื่อน SL มาที่ทุน ขายที่เหลือที่ TP2",
+                    invalidation_th=f"ราคาหลุด Stop Loss {fmt_price(pl['sl'])}"))
+            else:
+                pl, fb = a["plan_long"], a["fwd_long"]["best"]
+                picks.append(Pick(
+                    symbol=b, horizon="LONG", conviction=conv(a["score_long"]),
+                    action_th=("ซื้อ Tier 1 ตอนนี้ + ตั้ง Limit Tier 2 และ 3 รอ" if a["status_long"] == "BUY"
+                               else "ตั้ง Limit ทั้ง 3 Tier รอที่แนวรับ ไม่ไล่ราคา"),
+                    win_rate=int(round(a["wr_long"])), hold_min_days=int(a["hold_long"][0]),
+                    hold_max_days=int(a["hold_long"][1]), allocation_pct=round(alloc[(b, hz)], 1),
+                    thesis_th=f"คะแนนระยะยาว {a['score_long']:.0f}/100 (พื้นฐาน {a['score_fund']:.0f}, "
+                              f"มูลค่า {a['s_value']:.0f})"
+                              + (f" · ในอดีตสภาพเดียวกันถือ {fmt_days(fb['h'])} ชนะ {fb['win']:.0f}% "
+                                 f"กลาง {fmt_pct(fb['median'])}" if fb else ""),
+                    technical_th=tech, fundamental_th=fund_t, catalyst_th=cat,
+                    entry_trigger_th="ทยอยซื้อตามราคา Tier 1 / 2 / 3",
+                    exit_plan_th="ขาย 30% ที่ TP1, 40% ที่ TP2, ที่เหลือถือต่อ ขายเมื่อ Weekly ปิดใต้ EMA21 1W",
+                    invalidation_th=f"แท่ง Weekly ปิดต่ำกว่า {fmt_price(pl['invalid'])}"))
+    btc_1w = M_["btc_1w"]
+    return Strategy(
+        market_view_th=f"[แผนจากระบบ] ภาวะตลาด {reg} · BTC 1W {btc_1w} · Fear & Greed {fg}",
+        regime_advice_th=(f"ถือเงินสด ~{cash:.0f}% · คัดจากคะแนนรวม + สถานะเทคนิค + สถิติย้อนหลัง "
+                          "(เลือกเฉพาะ Win Rate ≥ 45% · ระยะกลางต้องซื้อได้/รอย่อ · ระยะยาวคะแนน ≥ 50)"),
+        cash_reserve_pct=cash, picks=picks)
+
+
+def run_ai_stage(client, model, prep: dict, n_med: int, n_long: int, use_risk: bool):
+    A_, F_, RS_, M_ = prep["analyses"], prep["fund"], prep["research"], prep["macro"]
+    notes, fallback = list(prep["notes"]), False
+    st.write("🧠 Strategist Agent: คัดเหรียญและจัดพอร์ต")
+    try:
+        strat, _ = run_strategist(client, model, A_, F_, RS_, M_, n_med, n_long, prep["corr_txt"])
+    except Exception as e:  # noqa: BLE001 — AI ล่ม/ไม่ว่าง → ใช้แผนจากระบบ ไม่ทิ้งงานทั้งหมด
+        notes.append(f"Strategist (AI) ไม่ว่าง: {str(e)[:90]} → ใช้แผนจากระบบ")
+        st.write("⚙️ Gemini ไม่ว่าง → สร้างแผนจากระบบแทน")
+        strat, fallback = rule_strategy(A_, F_, RS_, M_, n_med, n_long), True
+    picks, cash, dropped = finalize(strat, A_, F_)
+    if dropped:
+        notes.append("ตัดออกเพราะยังเป็นขาลง: " + ", ".join(dropped))
+    risk_out = None
+    if use_risk and picks and not fallback:
+        st.write("🛡️ Risk Manager Agent: ตรวจความเสี่ยงพอร์ต")
+        try:
+            risk_out = run_risk(client, model, picks, M_, prep["corr_txt"])
+            merge_risk(picks, risk_out)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"Risk Manager ไม่ตอบ: {str(e)[:80]}")
+    st.session_state["result"] = {
+        "time": datetime.now(timezone.utc), "analyses": A_, "info": prep["info"], "fund": F_, "research": RS_,
+        "sources": prep["sources"], "modes": prep["modes"], "macro": M_, "strat": strat, "picks": picks,
+        "cash": cash, "risk": risk_out, "corr": prep["corr"], "notes": notes, "fallback": fallback,
+        "model": "แผนจากระบบ" if fallback else st.session_state.get("active_model", model),
+        "secs": time.time() - prep["t0"],
+    }
+
+
+# =============================================================================
 # SIDEBAR
 # =============================================================================
 with st.sidebar:
@@ -1476,6 +1598,9 @@ with st.sidebar:
         cg_key = st.text_input("Demo API key", value=get_secret("COINGECKO_API_KEY"), type="password",
                                help="สมัครฟรีที่ coingecko.com/en/api — ช่วยลดปัญหาโดนจำกัดความถี่")
     scan = st.button("🚀 วิเคราะห์ตลาด", type="primary", width="stretch")
+    rerun_ai = st.button("🧠 ให้ AI วิเคราะห์ใหม่ (ใช้ข้อมูลเดิม)", width="stretch",
+                         disabled=not st.session_state.get("prep"),
+                         help="ไม่ดึงราคา/ข้อมูลใหม่ เรียกแค่ Strategist + Risk Manager — ใช้ตอน Gemini ไม่ว่าง")
     st.caption("⚠️ ไม่ใช่คำแนะนำการลงทุน · สถิติในอดีตไม่รับประกันอนาคต")
 
 st.title("🏦 Spot Investor AI")
@@ -1590,33 +1715,30 @@ if scan:
                 compute_scores(a, fund.get(b), research.get(b))
             corr, corr_txt = corr_pairs(analyses)
 
-            st.write("🧠 Strategist Agent: คัดเหรียญและจัดพอร์ต")
-            strat, _ = run_strategist(client, model_choice, analyses, fund, research, macro,
-                                      int(n_med), int(n_long), corr_txt)
-            picks, cash, dropped = finalize(strat, analyses, fund)
-            if dropped:
-                notes.append("ตัดออกเพราะยังเป็นขาลง: " + ", ".join(dropped))
-
-            risk_out = None
-            if use_risk and picks:
-                st.write("🛡️ Risk Manager Agent: ตรวจความเสี่ยงพอร์ต")
-                try:
-                    risk_out = run_risk(client, model_choice, picks, macro, corr_txt)
-                    merge_risk(picks, risk_out)
-                except Exception as e:  # noqa: BLE001
-                    notes.append(f"Risk Manager ไม่ตอบ: {str(e)[:80]}")
-
-            st.session_state["result"] = {
-                "time": datetime.now(timezone.utc), "analyses": analyses, "info": info, "fund": fund,
-                "research": research, "sources": sources, "modes": modes, "macro": macro, "strat": strat,
-                "picks": picks, "cash": cash, "risk": risk_out, "corr": corr, "notes": notes,
-                "model": st.session_state.get("active_model", model_choice), "secs": time.time() - t0,
-            }
+            prep = {"analyses": analyses, "info": info, "fund": fund, "research": research, "sources": sources,
+                    "modes": modes, "macro": macro, "corr": corr, "corr_txt": corr_txt, "notes": notes, "t0": t0}
+            st.session_state["prep"] = prep  # เก็บข้อมูลไว้ ถ้า AI ไม่ว่างจะได้ลองใหม่โดยไม่ต้องดึงข้อมูลซ้ำ
+            run_ai_stage(client, model_choice, prep, int(n_med), int(n_long), use_risk)
             status.update(label=f"วิเคราะห์เสร็จ ✅ ({time.time() - t0:.0f} วินาที)", state="complete", expanded=False)
         except Exception as e:  # noqa: BLE001
             status.update(label="เกิดข้อผิดพลาด ❌", state="error")
             st.exception(e)
             st.stop()
+
+if rerun_ai:
+    prep = st.session_state.get("prep")
+    if not prep or not gemini_key:
+        st.warning("ยังไม่มีข้อมูลเดิม — กด 🚀 วิเคราะห์ตลาด ก่อน")
+    else:
+        try:
+            client, _ = make_client(gemini_key, model_choice)
+            with st.status("🧠 ให้ AI วิเคราะห์ใหม่ด้วยข้อมูลเดิม...", expanded=True) as status:
+                prep["t0"] = time.time()
+                prep["notes"] = [n for n in prep["notes"] if "แผนจากระบบ" not in n and "Strategist" not in n]
+                run_ai_stage(client, model_choice, prep, int(n_med), int(n_long), use_risk)
+                status.update(label="เสร็จ ✅", state="complete", expanded=False)
+        except Exception as e:  # noqa: BLE001
+            st.error(str(e)[:300])
 
 R = st.session_state.get("result")
 if not R:
@@ -1644,6 +1766,9 @@ picks, strat = R["picks"], R["strat"]
 bkk = R["time"].astimezone(timezone(timedelta(hours=7)))
 st.caption(f"วิเคราะห์เมื่อ {bkk:%d/%m/%Y %H:%M} (เวลาไทย) · {R['model']} · {R['secs']:.0f} วินาที · "
            f"Research: {', '.join(R['modes']) or '-'}")
+if R.get("fallback"):
+    st.warning("⚠️ Gemini ไม่ว่างตอนนี้ — แสดง **แผนจากระบบ (คำนวณล้วน)** แทน ตัวเลขราคา/Win Rate/ระยะถือครบเหมือนเดิม "
+               "แต่ไม่มีบทวิเคราะห์ของ AI · กด **🧠 ให้ AI วิเคราะห์ใหม่ (ใช้ข้อมูลเดิม)** ใน Sidebar อีกครั้งใน 5-10 นาที")
 for n in R["notes"][:6]:
     st.caption(f"ℹ️ {n}")
 
